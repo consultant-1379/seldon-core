@@ -1,0 +1,33 @@
+{
+  "apiVersion": "machinelearning.seldon.io/v1alpha2",
+  "kind": "SeldonDeployment",
+  "metadata": {
+    "name": "mymodel"
+  },
+  "spec": {
+    "name": "mymodel",
+    "predictors": [
+      {
+        "componentSpecs": [{
+          "spec": {
+            "containers": [
+              {
+                "image": "seldonio/testmodel_non200:0.1",
+                "imagePullPolicy": "Never",
+                "name": "model"
+              }
+            ],
+            "terminationGracePeriodSeconds": 1
+          }
+        }],
+        "graph": {
+          "children": [],
+          "name": "model",
+          "type": "MODEL"
+        },
+        "name": "mymodel",
+        "replicas": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,266 @@
+/*
+Copyright (c) 2024 Seldon Technologies Ltd.
+
+Use of this software is governed BY
+(1) the license included in the LICENSE file or
+(2) if the license included in the LICENSE file is the Business Source License 1.1,
+the Change License after the Change Date as each is defined in accordance with the LICENSE file.
+*/
+
+package main
+
+import (
+	"context"
+	"flag"
+	"os"
+	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/seldonio/seldon-core/operator/constants"
+	"github.com/seldonio/seldon-core/operator/utils"
+
+	v2 "github.com/emissary-ingress/emissary/v3/pkg/api/getambassador.io/v2"
+	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+	machinelearningv1 "github.com/seldonio/seldon-core/operator/apis/machinelearning.seldon.io/v1"
+	machinelearningv1alpha2 "github.com/seldonio/seldon-core/operator/apis/machinelearning.seldon.io/v1alpha2"
+	machinelearningv1alpha3 "github.com/seldonio/seldon-core/operator/apis/machinelearning.seldon.io/v1alpha3"
+	"github.com/seldonio/seldon-core/operator/controllers"
+	k8sutils "github.com/seldonio/seldon-core/operator/utils/k8s"
+	"go.uber.org/automaxprocs/maxprocs"
+	"go.uber.org/zap"
+	istio "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	appsv1 "k8s.io/api/apps/v1"
+	autoscaling "k8s.io/api/autoscaling/v2"
+	corev1 "k8s.io/api/core/v1"
+	crdv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
+	ctrl "sigs.k8s.io/controller-runtime"
+	zapf "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	// +kubebuilder:scaffold:imports
+)
+
+const (
+	logLevelEnvVar          = "SELDON_LOG_LEVEL"
+	logLevelDefault         = "INFO"
+	debugEnvVar             = "SELDON_DEBUG"
+	leaderElectionIDEnvVar  = "LEADER_ELECTION_ID"
+	leaderElectionIDDefault = "a33bd623.machinelearning.seldon.io"
+)
+
+var (
+	debugDefault = false
+
+	scheme   = runtime.NewScheme()
+	setupLog = ctrl.Log.WithName("setup")
+)
+
+func init() {
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	_ = appsv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = autoscaling.AddToScheme(scheme)
+	_ = machinelearningv1.AddToScheme(scheme)
+	_ = machinelearningv1alpha2.AddToScheme(scheme)
+	_ = machinelearningv1alpha3.AddToScheme(scheme)
+	_ = v1beta1.AddToScheme(scheme)
+	_ = crdv1.AddToScheme(scheme)
+	if utils.GetEnv(controllers.ENV_KEDA_ENABLED, "false") == "true" {
+		_ = kedav1alpha1.AddToScheme(scheme)
+	}
+	if utils.GetEnv(controllers.ENV_ISTIO_ENABLED, "false") == "true" {
+		_ = istio.AddToScheme(scheme)
+	}
+	if utils.GetEnv(controllers.ENV_AMBASSADOR_ENABLED, "false") == "true" &&
+		utils.GetEnv(controllers.ENV_AMBASSADOR_VERSION, "v1") == "v2" {
+		_ = v2.AddToScheme(scheme)
+	}
+	// +kubebuilder:scaffold:scheme
+}
+
+func setupLogger(logLevel string, debug bool) {
+	level := zap.InfoLevel
+	switch logLevel {
+	case "DEBUG":
+		level = zap.DebugLevel
+	case "INFO":
+		level = zap.InfoLevel
+	case "WARN":
+	case "WARNING":
+		level = zap.WarnLevel
+	case "ERROR":
+		level = zap.ErrorLevel
+	case "FATAL":
+		level = zap.FatalLevel
+	}
+
+	atomicLevel := zap.NewAtomicLevelAt(level)
+
+	logger := zapf.New(
+		zapf.UseDevMode(debug),
+		zapf.Level(&atomicLevel),
+	)
+
+	ctrl.SetLogger(logger)
+}
+
+func main() {
+	var metricsAddr string
+	var enableLeaderElection bool
+	var webHookPort int
+	var namespace string
+	var operatorNamespace string
+	var createResources bool
+	var debug bool
+	var logLevel string
+	var leaderElectionID string
+	var leaderElectionResourceLock string
+	var leaderElectionLeaseDurationSecs int
+	var leaderElectionRenewDeadlineSecs int
+	var leaderElectionRetryPeriodSecs int
+
+	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
+		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&leaderElectionResourceLock, "leader-election-resource-lock", "", "Leader election resource lock")
+	flag.IntVar(&leaderElectionLeaseDurationSecs, "leader-election-lease-duration-secs", 0, "leadership election lease duration in secs")
+	flag.IntVar(&leaderElectionRenewDeadlineSecs, "leader-election-renew-deadline-secs", 0, "leadership election renew deadline in secs")
+	flag.IntVar(&leaderElectionRetryPeriodSecs, "leader-election-retry-period-secs", 0, "leadership election retry period in secs")
+	flag.IntVar(&webHookPort, "webhook-port", 443, "Webhook server port")
+	flag.StringVar(&namespace, "namespace", "", "The namespace to restrict the operator.")
+	flag.StringVar(&operatorNamespace, "operator-namespace", "default", "The namespace of the running operator")
+	flag.BoolVar(&createResources, "create-resources", false, "Create resources such as webhooks and configmaps on startup")
+	flag.BoolVar(
+		&debug,
+		"debug", utils.GetEnvAsBool(debugEnvVar, debugDefault),
+		"Enable debug mode. Logs will be sampled and less structured.",
+	)
+	flag.StringVar(&logLevel, "log-level", utils.GetEnv(logLevelEnvVar, logLevelDefault), "Log level.")
+	flag.StringVar(&leaderElectionID, "leader-election-id", utils.GetEnv(leaderElectionIDEnvVar, leaderElectionIDDefault), "Leader Election ID determines the name of the resource that leader election will use for holding the leader lock.")
+	flag.Parse()
+
+	ctx := context.Background()
+
+	setupLogger(logLevel, debug)
+
+	config := ctrl.GetConfigOrDie()
+
+	// Set runtime.GOMAXPROCS to respect container limits if the env var GOMAXPROCS is not set or is invalid, preventing CPU throttling.
+	undo, err := maxprocs.Set(maxprocs.Logger(setupLog.Info))
+	defer undo()
+	if err != nil {
+		setupLog.Error(err, "failed to set GOMAXPROCS")
+	}
+
+	// Override operator namespace from environment variable as the source of truth
+	operatorNamespace = utils.GetEnv("POD_NAMESPACE", operatorNamespace)
+
+	// This environment variable overwrites the namespace flag above
+	watchNamespace := utils.GetEnv("WATCH_NAMESPACE", "")
+	if watchNamespace != "" {
+		setupLog.Info("Overriding namespace from WATCH_NAMESPACE", "watchNamespace", watchNamespace)
+		namespace = watchNamespace
+	}
+
+	if createResources {
+		setupLog.Info("Intializing operator")
+		err := k8sutils.InitializeOperator(ctx, config, operatorNamespace, setupLog, scheme, namespace != "")
+		if err != nil {
+			setupLog.Error(err, "unable to initialise operator")
+			os.Exit(1)
+		}
+	}
+
+	// Assign leader election vars if provided
+	var leaderElectionLeaseDuration *time.Duration
+	var leaderElectionRenewDeadlineDuration *time.Duration
+	var leaderElectionRetryPeriodDuration *time.Duration
+	if leaderElectionLeaseDurationSecs > 0 {
+		duration := time.Second * time.Duration(leaderElectionLeaseDurationSecs)
+		leaderElectionLeaseDuration = &duration
+	}
+	if leaderElectionRenewDeadlineSecs > 0 {
+		duration := time.Second * time.Duration(leaderElectionRenewDeadlineSecs)
+		leaderElectionRenewDeadlineDuration = &duration
+	}
+	if leaderElectionRetryPeriodSecs > 0 {
+		duration := time.Second * time.Duration(leaderElectionRetryPeriodSecs)
+		leaderElectionRetryPeriodDuration = &duration
+	}
+
+	setupLog.Info("Leadership election",
+		"ID", leaderElectionID,
+		"resourceLock", leaderElectionResourceLock,
+		"leaseDuration", leaderElectionLeaseDurationSecs,
+		"renew deadline", leaderElectionRenewDeadlineSecs,
+		"retry period", leaderElectionRetryPeriodSecs)
+
+	options := ctrl.Options{
+		Scheme:                     scheme,
+		Metrics:                    server.Options{BindAddress: metricsAddr},
+		LeaderElection:             enableLeaderElection,
+		LeaderElectionID:           leaderElectionID,
+		LeaderElectionResourceLock: leaderElectionResourceLock,
+		LeaseDuration:              leaderElectionLeaseDuration,
+		RenewDeadline:              leaderElectionRenewDeadlineDuration,
+		RetryPeriod:                leaderElectionRetryPeriodDuration,
+		WebhookServer:              webhook.NewServer(webhook.Options{Port: webHookPort}),
+	}
+	// If the restricted namespace flag or watch env var is set, then restrict the cache to that namespace
+	if namespace != "" {
+		options.Cache = cache.Options{
+			DefaultNamespaces: map[string]cache.Config{namespace: {}},
+		}
+	}
+
+	mgr, err := ctrl.NewManager(config, options)
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	if err = (&controllers.SeldonDeploymentReconciler{
+		Client:    mgr.GetClient(),
+		ClientSet: kubernetes.NewForConfigOrDie(config),
+		Log:       ctrl.Log.WithName("controllers").WithName("SeldonDeployment"),
+		Scheme:    mgr.GetScheme(),
+		Namespace: namespace,
+		Recorder:  mgr.GetEventRecorderFor(constants.ControllerName),
+	}).SetupWithManager(ctx, mgr, constants.ControllerName); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SeldonDeployment")
+		os.Exit(1)
+	}
+
+	// Note that we need to create the webhooks for v1alpha2 and v1alpha3 because
+	// we are changing our storage version
+	if err = (&machinelearningv1alpha2.SeldonDeployment{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "SeldonDeployment")
+		os.Exit(1)
+	}
+
+	if err = (&machinelearningv1alpha3.SeldonDeployment{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "SeldonDeployment")
+		os.Exit(1)
+	}
+
+	if err = (&machinelearningv1.SeldonDeployment{}).SetupWebhookWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create webhook", "webhook", "SeldonDeployment")
+		os.Exit(1)
+	}
+
+	// +kubebuilder:scaffold:builder
+
+	setupLog.Info("starting manager")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}

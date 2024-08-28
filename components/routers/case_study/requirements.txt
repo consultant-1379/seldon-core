@@ -1,0 +1,8 @@
+pandas
+matplotlib
+kaggle
+scikit-learn
+numpy<1.19.0
+xgboost
+joblib
+

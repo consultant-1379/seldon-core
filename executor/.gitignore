@@ -1,0 +1,14 @@
+/executor
+/kafka-proxy
+./vendor/
+./tensorflow/
+./serving/
+./bin/
+cover.out
+executor.tar
+openapi/
+executor/api/rest/openapi/
+triton-inference-server/	
+_operator
+certs/
+artifacts
